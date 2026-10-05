@@ -2,7 +2,7 @@ import json
 import mimetypes
 import os
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from .domain import DomainError
 
@@ -52,6 +52,10 @@ def build_handler(service, static_dir):
                     return self._send(200, service.state())
                 if path == "/api/items":
                     return self._send(200, {"items": service.list_items()})
+                if path == "/api/readings":
+                    query = parse_qs(urlparse(self.path).query)
+                    source_id = query.get("source_id", [None])[0]
+                    return self._send(200, {"readings": service.list_readings(source_id)})
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["api", "items"]:
                     return self._send(200, service.get_item(int(parts[2])))
@@ -78,6 +82,12 @@ def build_handler(service, static_dir):
                 parts = [part for part in path.split("/") if part]
                 if parts == ["api", "items"]:
                     return self._send(201, service.create_item(payload, actor, role, region))
+                if parts == ["api", "readings"]:
+                    result = service.push_reading(payload, actor, role, region)
+                    status = 201 if result.get("status") == "processed" else 200
+                    return self._send(status, result)
+                if len(parts) == 4 and parts[:2] == ["api", "readings"] and parts[3] == "reopen":
+                    return self._send(200, {"items": service.reopen_reading(int(parts[2]), actor, role, region)})
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":
                     return self._send(201, service.add_source(int(parts[2]), payload, actor, role, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "actions":

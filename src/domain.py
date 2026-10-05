@@ -1,4 +1,12 @@
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(value):
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
 class DomainError(Exception):
@@ -91,3 +99,23 @@ def normalize_source(payload):
         "note": payload.get("note", ""),
     }
     return result
+
+
+def normalize_reading(payload):
+    source_id = require_text(payload, "source_id")
+    observed_at = parse_timestamp(payload, "observed_at")
+    concentration = number(payload, "concentration", 0)
+    limit_value = None
+    if payload.get("limit") is not None:
+        limit_value = number(payload, "limit", 0.000001)
+    extra = payload.get("payload")
+    if not isinstance(extra, dict):
+        extra = {}
+    return {
+        "source_id": source_id,
+        "observed_at": observed_at,
+        "concentration": concentration,
+        "contaminant": payload.get("contaminant"),
+        "limit_value": limit_value,
+        "payload": extra,
+    }
