@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from .audit import audit_hash, canonical_json
-from .domain import ConflictError, NotFoundError, DomainError
+from .domain import ConflictError, NotFoundError, DomainError, parse_instant
 
 
 def now_iso():
@@ -58,6 +58,19 @@ class Repository:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(item_id) REFERENCES items(id)
+                );
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL,
+                    reading_id TEXT NOT NULL,
+                    concentration REAL NOT NULL,
+                    limit_value REAL,
+                    observed_at TEXT NOT NULL,
+                    note TEXT,
+                    created_by TEXT NOT NULL,
+                    created_role TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source_id, reading_id)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,6 +241,155 @@ class Repository:
             self.append_audit(conn, item_id, action, actor, role, event_payload)
             conn.execute("COMMIT")
             return self.get_item(item_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def get_reading(self, reading_pk):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT * FROM readings WHERE id=?", (reading_pk,)).fetchone()
+            if row is None:
+                raise NotFoundError("reading_not_found", "水源读数不存在")
+            return dict(row)
+        finally:
+            conn.close()
+
+    def list_readings(self, source_id=None):
+        conn = self.connect()
+        try:
+            if source_id:
+                rows = conn.execute("SELECT * FROM readings WHERE source_id=? ORDER BY id DESC", (source_id,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM readings ORDER BY id DESC").fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def latest_reading(self, source_id):
+        conn = self.connect()
+        try:
+            rows = conn.execute("SELECT * FROM readings WHERE source_id=?", (source_id,)).fetchall()
+            if not rows:
+                return None
+            latest = max(rows, key=lambda row: parse_instant(row["observed_at"]))
+            return dict(latest)
+        finally:
+            conn.close()
+
+    def count_items(self, status):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT COUNT(*) AS total FROM items WHERE status=?", (status,)).fetchone()
+            return int(row["total"])
+        finally:
+            conn.close()
+
+    def _apply_plan(self, conn, plan, actor, role):
+        for step in plan:
+            row = conn.execute("SELECT version FROM items WHERE id=?", (step["item_id"],)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                (step["new_status"], version, canonical_json(step["new_payload"]), now_iso(), step["item_id"]),
+            )
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (step["item_id"], step["action"], actor, role, canonical_json(step["event_payload"]), now_iso()),
+            )
+            self.append_audit(conn, step["item_id"], step["action"], actor, role, step["event_payload"])
+
+    def record_reading(self, reading, plan, actor, role):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("SELECT observed_at FROM readings WHERE source_id=?", (reading["source_id"],)).fetchall()
+            if rows:
+                latest = max(parse_instant(row["observed_at"]) for row in rows)
+                if parse_instant(reading["observed_at"]) < latest:
+                    raise ConflictError("stale_reading", "观测时刻早于已有读数，读数被丢弃")
+            try:
+                conn.execute(
+                    "INSERT INTO readings(source_id,reading_id,concentration,limit_value,observed_at,note,created_by,created_role,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        reading["source_id"],
+                        reading["reading_id"],
+                        reading["concentration"],
+                        reading.get("limit"),
+                        reading["observed_at"],
+                        reading.get("note", ""),
+                        actor,
+                        role,
+                        now_iso(),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise ConflictError("duplicate_reading", "同一读数已经入账")
+            reading_pk = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            self._apply_plan(conn, plan, actor, role)
+            self.append_audit(
+                conn,
+                None,
+                "reading_recorded",
+                actor,
+                role,
+                {"reading_id": reading["reading_id"], "source_id": reading["source_id"], "observed_at": reading["observed_at"]},
+            )
+            conn.execute("COMMIT")
+            return self.get_reading(reading_pk)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def apply_plan(self, plan, actor, role):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._apply_plan(conn, plan, actor, role)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def promote_queued(self, actor, role):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE status='recheck_queued' ORDER BY id LIMIT 1").fetchone()
+            if row is None:
+                conn.execute("COMMIT")
+                return None
+            payload = json.loads(row["payload"])
+            version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE items SET status='recheck',version=?,payload=?,updated_at=? WHERE id=?",
+                (version, canonical_json(payload), now_iso(), row["id"]),
+            )
+            event = {"item_id": row["id"], "promoted": True}
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (row["id"], "recheck_promoted", actor, role, canonical_json(event), now_iso()),
+            )
+            self.append_audit(conn, row["id"], "recheck_promoted", actor, role, event)
+            conn.execute("COMMIT")
+            return self.get_item(row["id"])
         except Exception:
             try:
                 conn.execute("ROLLBACK")

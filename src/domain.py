@@ -1,4 +1,11 @@
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def parse_instant(value):
+    moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
 
 
 class DomainError(Exception):
@@ -41,7 +48,7 @@ def number(payload, name, minimum=None):
 def parse_timestamp(payload, name):
     value = require_text(payload, name)
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parse_instant(value)
     except ValueError:
         raise DomainError("invalid_timestamp", "%s 必须是 ISO 时间" % name)
     return value
@@ -61,6 +68,11 @@ def normalize_create(payload):
     population = int(payload.get("population", 0) or 0)
     if population < 0:
         raise DomainError("invalid_population", "受影响人数不能为负数")
+    region = payload.get("region")
+    if region is not None:
+        if not isinstance(region, str) or not region.strip():
+            raise DomainError("invalid_region", "管辖区域必须是非空字符串")
+        region = region.strip()
     stable_key = "%s|%s|%s" % (source_id, contaminant, detected_at)
     return {
         "source_id": source_id,
@@ -70,11 +82,26 @@ def normalize_create(payload):
         "limit": limit,
         "zone_ids": [zone.strip() for zone in zones],
         "population": population,
+        "region": region,
         "complaints": int(payload.get("complaints", 0) or 0),
         "notifications": [],
         "response_actions": [],
         "sample_results": [],
         "_stable_key": stable_key,
+    }
+
+
+def normalize_reading(payload):
+    source_id = require_text(payload, "source_id")
+    reading_id = require_text(payload, "reading_id")
+    observed_at = parse_timestamp(payload, "observed_at")
+    return {
+        "source_id": source_id,
+        "reading_id": reading_id,
+        "observed_at": observed_at,
+        "concentration": number(payload, "concentration", 0),
+        "limit": number(payload, "limit", 0.000001) if "limit" in payload else None,
+        "note": payload.get("note", ""),
     }
 
 

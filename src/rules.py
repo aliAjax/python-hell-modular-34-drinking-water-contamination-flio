@@ -4,6 +4,7 @@ ENTITY_TYPE = "water_contamination"
 INITIAL_STATUS = "detected"
 CREATE_ROLES = {"analyst", "dispatcher"}
 SOURCE_ROLES = {"analyst", "dispatcher", "field_operator", "lab"}
+READING_ROLES = {"monitor", "analyst", "regulator"}
 ACTION_ROLES = {
     "verify": {"analyst", "dispatcher"},
     "advise": {"coordinator", "dispatcher"},
@@ -12,11 +13,14 @@ ACTION_ROLES = {
     "disinfect": {"field_operator"},
     "sample": {"lab", "field_operator"},
     "restore": {"coordinator", "regulator"},
+    "release": {"field_operator", "coordinator", "regulator"},
     "cancel": {"coordinator"},
 }
-ENFORCE_REGION = False
-REGION_SENSITIVE_ACTIONS = set()
-ACTION_REQUIRES_VERSION = {"advise", "switch_source", "flush", "disinfect", "sample", "restore", "cancel"}
+ENFORCE_REGION = True
+REGION_SENSITIVE_ACTIONS = {"restore", "release"}
+ACTION_REQUIRES_VERSION = {"advise", "switch_source", "flush", "disinfect", "sample", "restore", "release", "cancel"}
+RECHECK_CAPACITY = 3
+RECHECK_STATUSES = {"recheck", "recheck_queued"}
 
 
 def assess(payload):
@@ -96,7 +100,7 @@ def apply_action(item, action, payload, actor, role):
         return "disinfected", current, {"zone_id": zone_id, "type": "disinfect"}
 
     if action == "sample":
-        _need_status(item, {"disinfected", "sampled"})
+        _need_status(item, {"disinfected", "sampled", "recheck"})
         result = {
             "sample_id": _text(payload, "sample_id"),
             "zone_id": _text(payload, "zone_id"),
@@ -105,7 +109,8 @@ def apply_action(item, action, payload, actor, role):
         if result["concentration"] < 0:
             raise DomainError("invalid_concentration", "浓度不能为负数")
         current.setdefault("sample_results", []).append(result)
-        return "sampled", current, {"sample_result": result}
+        new_status = "recheck" if status == "recheck" else "sampled"
+        return new_status, current, {"sample_result": result}
 
     if action == "restore":
         _need_status(item, {"sampled"})
@@ -116,6 +121,29 @@ def apply_action(item, action, payload, actor, role):
         if not results or any(float(result["concentration"]) > limit for result in results):
             raise DomainError("quality_not_met", "复检结果未全部达到限值", 409)
         current["restoration"] = {"actor": actor, "note": payload.get("note", "")}
+        return "restored", current, {"restoration": current["restoration"]}
+
+    if action == "release":
+        _need_status(item, {"recheck"})
+        recheck = current.get("recheck") or {}
+        start = int(recheck.get("sample_start", 0))
+        recent = current.get("sample_results", [])[start:]
+        if not recent:
+            raise DomainError("sample_required", "退回复检后需要重新取样确认", 409)
+        limit = float(current.get("limit", 0))
+        last_failure = -1
+        for index, result in enumerate(recent):
+            if float(result["concentration"]) > limit:
+                last_failure = index
+        confirmed = recent[last_failure + 1:]
+        if not confirmed:
+            raise DomainError("quality_not_met", "复检结果未达到限值，需重新取样确认", 409)
+        current["restoration"] = {
+            "actor": actor,
+            "note": payload.get("note", ""),
+            "confirmed_after_reading": recheck.get("reading_id"),
+        }
+        current.pop("recheck", None)
         return "restored", current, {"restoration": current["restoration"]}
 
     if action == "cancel":

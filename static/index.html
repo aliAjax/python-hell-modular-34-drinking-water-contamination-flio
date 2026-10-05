@@ -1,5 +1,8 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>饮用水污染响应</title><body><h1>市政饮用水污染响应</h1><p>使用 JSON API 创建污染事件、登记水源或管网记录，并完成复检、通知、冲洗、消毒和恢复。</p><pre>GET /health
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>饮用水污染响应</title><body><h1>市政饮用水污染响应</h1><p>使用 JSON API 创建污染事件、登记水源或管网记录，并完成复检、通知、冲洗、消毒和恢复。上游监测站推送水源读数后，系统自动按水源编号重算跟进中片区的等级，超标时把已恢复片区退回复检（容量有限，超出排队），监管可按读数批量重开。</p><pre>GET /health
 GET /api/state
 POST /api/items
 POST /api/items/{id}/sources
-POST /api/items/{id}/actions</pre></body></html>
+POST /api/items/{id}/actions
+POST /api/readings
+GET /api/readings
+POST /api/readings/{id}/reopen</pre></body></html>
